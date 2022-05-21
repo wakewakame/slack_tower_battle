@@ -1,7 +1,6 @@
 extern crate base64;
 use std::error::Error;
 use std::fmt;
-use ws::connect;
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -149,8 +148,6 @@ pub async fn download_data(url: &String) -> SlackResult<Vec<u8>> {
     Ok(response.bytes().await?.to_vec())
 }
 
-use std::rc::Rc;
-use std::cell::RefCell;
 #[derive(Debug, Clone, Copy)]
 enum Disconnect{ Reconnecting, Exit }
 #[derive(Debug)]
@@ -160,97 +157,92 @@ pub struct Message {
     pub user_id: String,
     pub text: String,
 }
-enum ReceiverMessage{
-    Disconnect,
-    Message(Message),
-}
-async fn single_websocket_receiver(id: u64, app_token: String, sender: Sender<ReceiverMessage>) -> SlackResult<Disconnect> {
-
+use futures_util::{pin_mut, StreamExt};
+use tokio_tungstenite::tungstenite::protocol;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+async fn single_websocket_receiver(id: u64, app_token: String, sender: Sender<Message>) -> SlackResult<Disconnect> {
     // websocketのURLを取得
     println!("status(id: {}): connecting websocket", id);
     let url = get_websocket_url(app_token).await;
     if let Err(err) = url { return Err(err); }
     let websocket_url = url.unwrap();
 
-    let sender = Rc::new(RefCell::new(sender));
-    let disconnect_receiver = Rc::new(RefCell::new(Disconnect::Exit));
-    let disconnect = Rc::clone(&disconnect_receiver);
-
     // websocketに接続
-    connect(format!("{}&debug_reconnects=true", websocket_url), |out| {
-        println!("status(id: {}): connected websocket", id);
-        let disconnect = Rc::clone(&disconnect);
-        let sender = Rc::clone(&sender);
+    let url = url::Url::parse(&format!("{}&debug_reconnects=true", websocket_url)).unwrap();
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+    println!("status(id: {}): connected websocket", id);
 
-        // メッセージを受信する都度呼ばれるクロージャ
-        move |msg: ws::Message| {
-            match msg {
-                ws::Message::Text(json) => {
-                    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    // 再接続フラグ
+    let reconnect = Arc::new(AtomicBool::new(false));
 
-                    // メッセージを受け取ったことをslackにレスポンスする
-                    // 参考: https://api.slack.com/apis/connections/socket-implement#acknowledge
-                    if let Some(envelope_id) = json.get("envelope_id") {
-                        out.send(serde_json::json!({"envelope_id": envelope_id}).to_string())?;
-                    }
+    let (write, read) = ws_stream.split();
+    let (responder_tx, responder_rx) = futures_channel::mpsc::channel(128);
+    let responder = responder_rx.map(Ok).forward(write);
+    let receiver = read.for_each(|message| async {
+        if let Ok(protocol::Message::Text(json)) = message {
+            let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            // メッセージを受け取ったことをslackにレスポンスする
+            // 参考: https://api.slack.com/apis/connections/socket-implement#acknowledge
+            if let Some(envelope_id) = json.get("envelope_id") {
+                let _ = responder_tx.clone().try_send(protocol::Message::Text(serde_json::json!({"envelope_id": envelope_id}).to_string()));
+            }
 
-                    let message_type =
-                        if let Some(value) = json.get("type") { value.as_str() }
+            let message_type =
+                if let Some(value) = json.get("type") { value.as_str() }
+                else { None };
+            match message_type {
+                Some("events_api") => {
+                    let event_type =
+                        if let Some(value) = json.pointer("/payload/event/type") { value.as_str() }
                         else { None };
-                    match message_type {
-                        Some("events_api") => {
-                            let event_type =
-                                if let Some(value) = json.pointer("/payload/event/type") { value.as_str() }
-                                else { None };
-                            let channel_id =
-                                if let Some(value) = json.pointer("/payload/event/channel") { value.as_str() }
-                                else { None };
-                            let user_id =
-                                if let Some(value) = json.pointer("/payload/event/user") { value.as_str() }
-                                else { None };
-                            let text =
-                                if let Some(value) = json.pointer("/payload/event/text") { value.as_str() }
-                                else { None };
-                            match (event_type, channel_id, user_id, text) {
-                                (Some(event_type), Some(channel_id), Some(user_id), Some(text)) => {
-                                    let message = Message {
-                                        event_type: event_type.to_string(),
-                                        channel_id: channel_id.to_string(),
-                                        user_id: user_id.to_string(),
-                                        text: text.to_string(),
-                                    };
-                                    println!("received(id: {}): message {:?}", id, message);
-                                    let _ = (*sender.borrow_mut()).try_send(ReceiverMessage::Message(message));
-                                },
-                                _ => {},
+                    let channel_id =
+                        if let Some(value) = json.pointer("/payload/event/channel") { value.as_str() }
+                        else { None };
+                    let user_id =
+                        if let Some(value) = json.pointer("/payload/event/user") { value.as_str() }
+                        else { None };
+                    let text =
+                        if let Some(value) = json.pointer("/payload/event/text") { value.as_str() }
+                        else { None };
+                    match (event_type, channel_id, user_id, text) {
+                        (Some(event_type), Some(channel_id), Some(user_id), Some(text)) => {
+                            let message = Message {
+                                event_type: event_type.to_string(),
+                                channel_id: channel_id.to_string(),
+                                user_id: user_id.to_string(),
+                                text: text.to_string(),
                             };
-                        },
-                        Some("disconnect") => {
-                            let message_reason =
-                                if let Some(value) = json.get("reason") { value.as_str() }
-                                else { None };
-                            match message_reason {
-                                Some("warning") | Some("refresh_requested") => {
-                                    println!("received(id: {}): refresh request", id);
-                                    *disconnect.borrow_mut() = Disconnect::Reconnecting;
-                                    out.close(ws::CloseCode::Normal)?;
-                                },
-                                _ => {},
-                            };
+                            println!("received(id: {}): message {:?}", id, message);
+                            let _ = sender.clone().try_send(message);
                         },
                         _ => {},
                     };
                 },
-                ws::Message::Binary(_) => {},
-            }
-            Ok(())
+                Some("disconnect") => {
+                    let message_reason =
+                        if let Some(value) = json.get("reason") { value.as_str() }
+                        else { None };
+                    match message_reason {
+                        Some("warning") | Some("refresh_requested") => {
+                            println!("received(id: {}): refresh request", id);
+                            Arc::clone(&reconnect).store(true, std::sync::atomic::Ordering::SeqCst);
+                            //let _ = responder_tx.clone().try_send(protocol::Message::Close(None));
+                        },
+                        _ => {},
+                    };
+                },
+                _ => {},
+            };
         }
-    })?;
-
+    });
+    pin_mut!(receiver, responder);
+    future::select(receiver, responder).await;
     println!("status(id: {}): disconnected", id);
-    let _ = (*sender.borrow_mut()).try_send(ReceiverMessage::Disconnect);
-    return Ok(*disconnect_receiver.borrow());
-
+    if reconnect.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(Disconnect::Reconnecting);
+    }
+    Ok(Disconnect::Exit)
 }
 
 use futures::future;
@@ -258,7 +250,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use futures_channel::mpsc::{ channel, Sender };
 pub async fn websocket_receiver<F: Fn(Message)>(app_token: String, message_handler: F) {
-    async fn auto_reconnecting(id: u64, app_token: String, sender: Sender<ReceiverMessage>) {
+    async fn auto_reconnecting(id: u64, app_token: String, sender: Sender<Message>) {
         while let Ok(Disconnect::Reconnecting) = single_websocket_receiver(id, app_token.clone(), sender.clone()).await {}
     }
 
@@ -269,7 +261,7 @@ pub async fn websocket_receiver<F: Fn(Message)>(app_token: String, message_handl
     // 2.  1つのタスクが終了したら全て終了するようにする
     //     (JoinHandleはjoinしなくてもいい説も確認)
     // 3.  エラー処理をちゃんと実装する
-    async fn multi_websocket_receiver(app_token: String, sender: Sender<ReceiverMessage>) {
+    async fn multi_websocket_receiver(app_token: String, sender: Sender<Message>) {
         let num_channels = 4;
         let mut tasks = Vec::new();
         for id in 0..num_channels {
@@ -280,16 +272,13 @@ pub async fn websocket_receiver<F: Fn(Message)>(app_token: String, message_handl
         future::join_all(tasks.into_iter()).await;
     }
 
-    let (sender, mut receiver) = channel::<ReceiverMessage>(128);
+    let (sender, mut receiver) = channel::<Message>(128);
     let _ = tokio::spawn(multi_websocket_receiver(app_token, sender.clone()));
 
     loop {
         let receive = receiver.try_next();
         if let Ok(Some(message)) = receive {
-            match message {
-                ReceiverMessage::Disconnect => { break; },
-                ReceiverMessage::Message(message) => { message_handler(message); },
-            }
+            message_handler(message);
         }
         else {
             sleep(Duration::from_millis(1000 / 60 as u64)).await;

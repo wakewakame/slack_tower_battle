@@ -5,6 +5,8 @@ mod stage;
 use std::env;
 use dotenv::dotenv;
 use chrono::prelude::*;
+use futures::future;
+use futures_util::pin_mut;
 
 use std::collections::HashMap;
 use std::sync::{ Arc, Mutex };
@@ -132,10 +134,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     }
-    tokio::spawn(stage_cleaner(Arc::clone(&stages)));
+    let channel_deleter = tokio::spawn(stage_cleaner(Arc::clone(&stages)));
 
     // slackから取得したwebsocketのURLに接続
-    slack::websocket_receiver(slack_app_token.clone(), |message| {
+    let receiver = slack::websocket_receiver(slack_app_token.clone(), |message| {
         let stages = Arc::clone(&stages);
         let stages = stages.lock();
         if let Ok(mut stages) = stages {
@@ -151,7 +153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 tokio::spawn(compute_turn(slack_bot_token.clone(), shapes.clone(), Arc::clone(channel_stage), message));
             }
         }
-    }).await;
+    });
+    pin_mut!(receiver, channel_deleter);
+    future::select(receiver, channel_deleter).await;
 
     Ok(())
 }
