@@ -169,7 +169,8 @@ async fn single_websocket_receiver(id: u64, app_token: String, sender: Sender<Me
     let websocket_url = url.unwrap();
 
     // websocketに接続
-    let url = url::Url::parse(&format!("{}&debug_reconnects=true", websocket_url)).unwrap();
+    //let url = url::Url::parse(&format!("{}&debug_reconnects=true", websocket_url)).unwrap();
+    let url = url::Url::parse(&format!("{}", websocket_url)).unwrap();
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
     println!("status(id: {}): connected websocket", id);
 
@@ -246,12 +247,19 @@ async fn single_websocket_receiver(id: u64, app_token: String, sender: Sender<Me
 }
 
 use futures::future;
-use std::time::Duration;
-use tokio::time::sleep;
 use futures_channel::mpsc::{ channel, Sender };
 pub async fn websocket_receiver<F: Fn(Message)>(app_token: String, message_handler: F) {
     async fn auto_reconnecting(id: u64, app_token: String, sender: Sender<Message>) {
-        while let Ok(Disconnect::Reconnecting) = single_websocket_receiver(id, app_token.clone(), sender.clone()).await {}
+        //while let Ok(Disconnect::Reconnecting) = single_websocket_receiver(id, app_token.clone(), sender.clone()).await {}
+        loop{
+            if let Ok(Disconnect::Reconnecting) = single_websocket_receiver(id, app_token.clone(), sender.clone()).await {
+                continue;
+            }
+            else {
+                // 異常終了した場合は5分経過した後に再接続を試行
+                tokio::time::sleep(tokio::time::Duration::from_secs(360)).await;
+            }
+        }
     }
 
     // 4つのチャンネルでメッセージの受信を分散
@@ -267,7 +275,7 @@ pub async fn websocket_receiver<F: Fn(Message)>(app_token: String, message_handl
         for id in 0..num_channels {
             let task = tokio::spawn(auto_reconnecting(id, app_token.clone(), sender.clone()));
             tasks.push(task);
-            sleep(Duration::from_millis(1000 * 360 / (num_channels + 1) as u64)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000 * 360 / (num_channels + 1) as u64)).await;
         }
         future::join_all(tasks.into_iter()).await;
     }
@@ -281,7 +289,7 @@ pub async fn websocket_receiver<F: Fn(Message)>(app_token: String, message_handl
             message_handler(message);
         }
         else {
-            sleep(Duration::from_millis(1000 / 60 as u64)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000 / 60 as u64)).await;
         }
     }
 }
